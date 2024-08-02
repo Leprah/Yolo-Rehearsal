@@ -1,4 +1,5 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
+print('Ultralytics customized')
 
 __version__ = "8.2.71"
 

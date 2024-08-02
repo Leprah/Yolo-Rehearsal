@@ -403,6 +403,7 @@ class ClassificationDataset:
     """
 
     def __init__(self, root, args, augment=False, prefix=""):
+        print('ClassificationDataset args', args)
         """
         Initialize YOLO object with root, image size, augmentations, and cache settings.
 
