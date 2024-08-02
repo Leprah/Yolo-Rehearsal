@@ -6,6 +6,7 @@ from collections import defaultdict
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
+import os
 
 import cv2
 import numpy as np
@@ -383,6 +384,26 @@ class SemanticDataset(BaseDataset):
         """Initialize a SemanticDataset object."""
         super().__init__()
 
+class ConcatImageFolder:
+    def __init__(self, image_folder_list=[]):
+        self.ifl = image_folder_list
+    
+    def add(self, imgfold):
+        self.ifl.append(imgfold)
+    
+    @property
+    def samples(self):
+        all_samples = []
+        for imgfold in self.ifl:
+            all_samples.extend(imgfold.samples)
+        return all_samples
+    
+    @property
+    def roots(self):
+        return [imgfold.root for imgfold in self.ifl]
+    
+    def __len__(self):
+        return sum([len(imgfold)  for imgfold in self.ifl])
 
 class ClassificationDataset:
     """
@@ -403,7 +424,7 @@ class ClassificationDataset:
     """
 
     def __init__(self, root, args, augment=False, prefix=""):
-        print('ClassificationDataset args', args)
+        print('ClassificationDataset root, args:', root, str(args))
         """
         Initialize YOLO object with root, image size, augmentations, and cache settings.
 
@@ -419,14 +440,24 @@ class ClassificationDataset:
         """
         import torchvision  # scope for faster 'import ultralytics'
 
-        # Base class assigned as attribute rather than used as base class to allow for scoping slow torchvision import
-        if TORCHVISION_0_18:  # 'allow_empty' argument first introduced in torchvision 0.18
-            self.base = torchvision.datasets.ImageFolder(root=root, allow_empty=True)
-        else:
-            self.base = torchvision.datasets.ImageFolder(root=root)
-        self.samples = self.base.samples
-        self.root = self.base.root
-
+        root_type = os.path.split(root)[1]
+        root = os.path.split(root)[0]
+        all_dataset_paths = [root]+list(args.rehearsal_replay_paths)
+        all_image_folders = []
+        
+        for data_path in all_dataset_paths:
+            data_path = os.path.join(data_path, root_type)
+            if TORCHVISION_0_18:  # 'allow_empty' argument first introduced in torchvision 0.18
+                dataset = torchvision.datasets.ImageFolder(root=data_path, allow_empty=True)
+            else:
+                dataset = torchvision.datasets.ImageFolder(root=data_path)
+            all_image_folders.append(dataset)
+    
+        self.concat_dataset = ConcatImageFolder(all_image_folders)
+        self.samples = self.concat_dataset.samples
+        self.roots = self.concat_dataset.roots
+        print('ACTUAL DATASET COUNT:', len(self.concat_dataset))
+        
         # Initialize attributes
         if augment and args.fraction < 1.0:  # reduce training fraction
             self.samples = self.samples[: round(len(self.samples) * args.fraction)]
@@ -481,39 +512,47 @@ class ClassificationDataset:
 
     def verify_images(self):
         """Verify all images in dataset."""
-        desc = f"{self.prefix}Scanning {self.root}..."
-        path = Path(self.root).with_suffix(".cache")  # *.cache file path
+        all_samples = []
+        for root in self.roots:
+            desc = f"{self.prefix}Scanning {root}..."
+            path = Path(root).with_suffix(".cache")  # *.cache file path
 
-        with contextlib.suppress(FileNotFoundError, AssertionError, AttributeError):
-            cache = load_dataset_cache_file(path)  # attempt to load a *.cache file
-            assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
-            assert cache["hash"] == get_hash([x[0] for x in self.samples])  # identical hash
-            nf, nc, n, samples = cache.pop("results")  # found, missing, empty, corrupt, total
-            if LOCAL_RANK in {-1, 0}:
-                d = f"{desc} {nf} images, {nc} corrupt"
-                TQDM(None, desc=d, total=n, initial=n)
-                if cache["msgs"]:
-                    LOGGER.info("\n".join(cache["msgs"]))  # display warnings
-            return samples
+            with contextlib.suppress(FileNotFoundError, AssertionError, AttributeError):
+                cache = load_dataset_cache_file(path)  # attempt to load a *.cache file
+                assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
+                assert cache["hash"] == get_hash([x[0] for x in self.samples])  # identical hash
+                nf, nc, n, samples = cache.pop("results")  # found, missing, empty, corrupt, total
+                if LOCAL_RANK in {-1, 0}:
+                    d = f"{desc} {nf} images, {nc} corrupt"
+                    TQDM(None, desc=d, total=n, initial=n)
+                    if cache["msgs"]:
+                        LOGGER.info("\n".join(cache["msgs"]))  # display warnings
+                # return samples
+                all_samples.extend(samples)
+                continue
 
-        # Run scan if *.cache retrieval failed
-        nf, nc, msgs, samples, x = 0, 0, [], [], {}
-        with ThreadPool(NUM_THREADS) as pool:
-            results = pool.imap(func=verify_image, iterable=zip(self.samples, repeat(self.prefix)))
-            pbar = TQDM(results, desc=desc, total=len(self.samples))
-            for sample, nf_f, nc_f, msg in pbar:
-                if nf_f:
-                    samples.append(sample)
-                if msg:
-                    msgs.append(msg)
-                nf += nf_f
-                nc += nc_f
-                pbar.desc = f"{desc} {nf} images, {nc} corrupt"
-            pbar.close()
-        if msgs:
-            LOGGER.info("\n".join(msgs))
-        x["hash"] = get_hash([x[0] for x in self.samples])
-        x["results"] = nf, nc, len(samples), samples
-        x["msgs"] = msgs  # warnings
-        save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
-        return samples
+            # Run scan if *.cache retrieval failed
+            nf, nc, msgs, samples, x = 0, 0, [], [], {}
+            with ThreadPool(NUM_THREADS) as pool:
+                results = pool.imap(func=verify_image, iterable=zip(self.samples, repeat(self.prefix)))
+                pbar = TQDM(results, desc=desc, total=len(self.samples))
+                for sample, nf_f, nc_f, msg in pbar:
+                    if nf_f:
+                        samples.append(sample)
+                    if msg:
+                        msgs.append(msg)
+                    nf += nf_f
+                    nc += nc_f
+                    pbar.desc = f"{desc} {nf} images, {nc} corrupt"
+                pbar.close()
+            if msgs:
+                LOGGER.info("\n".join(msgs))
+            x["hash"] = get_hash([x[0] for x in self.samples])
+            x["results"] = nf, nc, len(samples), samples
+            x["msgs"] = msgs  # warnings
+            save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
+            # return samples
+            all_samples.extend(samples)
+            continue
+        
+        return all_samples
