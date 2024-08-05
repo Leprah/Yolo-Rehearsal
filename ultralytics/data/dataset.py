@@ -442,7 +442,7 @@ class ClassificationDataset:
 
         root_type = os.path.split(root)[1]
         root = os.path.split(root)[0]
-        all_dataset_paths = [root]+list(args.rehearsal_replay_paths)
+        all_dataset_paths = [root]+list(args.rehearsal_replay_paths or [])
         all_image_folders = []
         
         for data_path in all_dataset_paths:
